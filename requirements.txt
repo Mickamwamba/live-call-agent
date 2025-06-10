@@ -26,3 +26,8 @@ pgvector
 python-dotenv
 langchain-openai
 gradio[oauth]
+pyaudio
+amazon-transcribe
+flask
+flask-cors
+aiofile
