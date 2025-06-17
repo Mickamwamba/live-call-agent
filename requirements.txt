@@ -31,3 +31,4 @@ amazon-transcribe
 flask
 flask-cors
 aiofile
+langchain-openai

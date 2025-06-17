@@ -104,6 +104,32 @@ from flask_cors import CORS
 import json
 import requests
 
+import os
+import fitz  # PyMuPDF
+from typing import List, Dict, Any
+import time
+from fastapi import FastAPI, Request, Form, UploadFile, File
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
+import uvicorn
+import logging
+from pathlib import Path
+import asyncio
+
+# Import necessary LangChain components
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+
+from langchain_community.chat_models import ChatOpenAI
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
+from agent2 import CodeReviewAgent
+from agent_main import AgentAssistant
+import asyncio
+from langchain_community.embeddings import OpenAIEmbeddings
+
 app = Flask(__name__)
 from dotenv import load_dotenv
 
@@ -123,6 +149,15 @@ OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+pdf_directory = os.getenv("PDF_DIRECTORY", "./documents")
+# agent = CodeReviewAgent(pdf_directory)
+
+agent = AgentAssistant(pdf_directory)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class SSETranscriptHandler(TranscriptResultStreamHandler):
     def __init__(self, output_stream, queue):
@@ -201,13 +236,12 @@ def summarize_call():
             return {"error": "Transcript is required"}, 400
         
         transcript = data['transcript']
-        print("transcript===============>>",transcript)
         
         if not OPENAI_API_KEY:
             return {"error": "OpenAI API key not configured"}, 500
         
-        # Call OpenAI API
-        response = requests.post(
+        # Generate summary and analysis
+        summary_response = requests.post(
             'https://api.openai.com/v1/chat/completions',
             headers={
                 'Authorization': f'Bearer {OPENAI_API_KEY}',
@@ -222,7 +256,7 @@ def summarize_call():
                     },
                     {
                         'role': 'user',
-                        'content': f'Please analyze this customer call transcript: {transcript}'
+                        'content': transcript
                     }
                 ],
                 'response_format': {'type': 'json_object'}
@@ -230,29 +264,177 @@ def summarize_call():
             timeout=30
         )
         
-        if response.status_code == 200:
-            result = response.json()
-            # Extract the content from OpenAI response
-            summary_content = result['choices'][0]['message']['content']
-            print("xxxxxxxxxxxxxxxxxxxxxxxxx",summary_content)
-            # Parse the JSON response from OpenAI
-            try:
-                summary_data = json.loads(summary_content)
-                return summary_data, 200
-            except json.JSONDecodeError:
-                # If OpenAI didn't return valid JSON, wrap it in a basic structure
-                return {
-                    "summary": summary_content,
-                    "key_issues": [],
-                    "customer_mood": {"tone": "unknown", "confidence": 0}
-                }, 200
+        if summary_response.status_code == 200:
+            summary_result = summary_response.json()
+            summary_data = json.loads(summary_result['choices'][0]['message']['content'])
+            
+            # Ensure default values
+            result = {
+                'summary': summary_data.get('summary', 'Customer call processed'),
+                'key_issues': summary_data.get('key_issues', ['Technical inquiry']),
+                'customer_mood': summary_data.get('customer_mood', {'tone': 'Neutral', 'confidence': 75})
+            }
+            return result, 200
         else:
-            return {"error": f"OpenAI API error: {response.status_code}"}, 500
+            return {"error": f"OpenAI API error: {summary_response.status_code}"}, 500
             
     except requests.RequestException as e:
         return {"error": f"Request failed: {str(e)}"}, 500
     except Exception as e:
         return {"error": f"Unexpected error: {str(e)}"}, 500
 
+@app.route('/resolutions', methods=['POST'])
+def get_resolutions():
+    try:
+        # Get the transcript from the request
+        data = request.get_json()
+        if not data or 'transcript' not in data:
+            return {"error": "Transcript is required"}, 400
+        
+        transcript = data['transcript']
+        
+        if not OPENAI_API_KEY:
+            return {"error": "OpenAI API key not configured"}, 500
+        
+        # Generate resolution suggestions
+        resolution_response = requests.post(
+            'https://api.openai.com/v1/chat/completions',
+            headers={
+                'Authorization': f'Bearer {OPENAI_API_KEY}',
+                'Content-Type': 'application/json'
+            },
+            json={
+                'model': 'gpt-4o-mini',
+                'messages': [
+                    {
+                        'role': 'system',
+                        'content': 'You are a technical support agent. Based on the customer issue, provide 2-3 potential resolutions. For each resolution, provide: title, source, confidence (0-100), steps (array of strings), category. Return as JSON with "resolutions" array field.'
+                    },
+                    {
+                        'role': 'user',
+                        'content': f'Customer issue: {transcript}'
+                    }
+                ],
+                'response_format': {'type': 'json_object'}
+            },
+            timeout=30
+        )
+        
+        if resolution_response.status_code == 200:
+            resolution_result = resolution_response.json()
+            resolution_data = json.loads(resolution_result['choices'][0]['message']['content'])
+            
+            result = {
+                'resolutions': resolution_data.get('resolutions', [])
+            }
+            return result, 200
+        else:
+            return {"error": f"OpenAI API error: {resolution_response.status_code}"}, 500
+            
+    except requests.RequestException as e:
+        return {"error": f"Request failed: {str(e)}"}, 500
+    except Exception as e:
+        return {"error": f"Unexpected error: {str(e)}"}, 500
+
+@app.route('/test', methods=['GET'])
+def get_insights2():
+    # initialize the agent which is connected to the vector store: - it was initialized before already 
+    query = "The customer is calling Bright Connect customer support to inquire about an unrecognized charge on their recent bill. They seek assistance in understanding the billing details."
+    res = asyncio.run(agent.get_resolutions(query))
+    print(res)
+    result = {"data": res}
+    return result,200
+
+
+
+
+@app.route('/insights', methods=['POST'])
+def get_insights():
+    try:
+        # Get the transcript from the request
+        data = request.get_json()
+        if not data or 'transcript' not in data:
+            return {"error": "Transcript is required"}, 400
+        
+        transcript = data['transcript']
+        
+        if not OPENAI_API_KEY:
+            return {"error": "OpenAI API key not configured"}, 500
+        
+        # Generate insights and procedures
+        insights_response = requests.post(
+            'https://api.openai.com/v1/chat/completions',
+            headers={
+                'Authorization': f'Bearer {OPENAI_API_KEY}',
+                'Content-Type': 'application/json'
+            },
+            json={
+                'model': 'gpt-4o-mini',
+                'messages': [
+                    {
+                        'role': 'system',
+                        'content': 'You are a customer service manager. Based on the customer issue, provide: 1) Recommended procedures (array of strings) 2) Mock previous tickets (array with id, date, issue, status) 3) Customer mood assessment. Return as JSON with fields: procedures, previous_tickets, customer_mood.'
+                    },
+                    {
+                        'role': 'user',
+                        'content': f'Customer issue: {transcript}'
+                    }
+                ],
+                'response_format': {'type': 'json_object'}
+            },
+            timeout=30
+        )
+        
+        if insights_response.status_code == 200:
+            insights_result = insights_response.json()
+            insights_data = json.loads(insights_result['choices'][0]['message']['content'])
+            
+            result = {
+                'procedures': insights_data.get('procedures', ['Follow standard procedures']),
+                'previous_tickets': insights_data.get('previous_tickets', []),
+                'customer_mood': insights_data.get('customer_mood', {'tone': 'Neutral', 'confidence': 75})
+            }
+            return result, 200
+        else:
+            return {"error": f"OpenAI API error: {insights_response.status_code}"}, 500
+            
+    except requests.RequestException as e:
+        return {"error": f"Request failed: {str(e)}"}, 500
+    except Exception as e:
+        return {"error": f"Unexpected error: {str(e)}"}, 500
+
+
+@app.post("/upload")
+async def upload_document(file: UploadFile = File(...)):
+    """Upload a new standards document"""
+    # print(f"Received file: {file}, type: {type(file)}")
+
+
+    # print("file================>",file)
+    try:
+        # Save the uploaded file
+        # file_path = f"./uploads/{file.filename}"
+        # os.makedirs("./uploads", exist_ok=True)
+        file_path = "/Users/michaelkimollo/DSProjects/impetus-hackathon/documents/do_178b.pdf"
+        # with open(file_path, "wb") as f:
+        #     content = await file.read()
+        #     f.write(content)
+        
+        # Add the document to the agent
+        success = await agent.add_document(file_path)
+        
+        if success:
+            # return {"message": f"Document {file.filename} uploaded and processed successfully"}
+            return {"message": f"Document uploaded and processed successfully"}
+        
+        else:
+            return {"message": f"Error processing document {file.filename}"}
+    except Exception as e:
+        logger.error(f"Error uploading document: {e}")
+        return {"error": str(e)}
+
 if __name__ == '__main__':
+    # res = asyncio.run(agent.review_code("The customer is calling Bright Connect customer support to inquire about an unrecognized charge on their recent bill. They seek assistance in understanding the billing details."))
+    # review = await agent.review_code(code="your code here", language="python")
+
     app.run(debug=True, threaded=True)
